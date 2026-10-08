@@ -106,7 +106,10 @@ installs no hook and no CLI.
 
 The host readback above confirms that the plugin, extension, or skill was
 registered; it does not by itself prove that a delete hook is active. After a
-native plugin or extension install (not a skills.sh-only install), run:
+native plugin or extension install (not a skills.sh-only install), run these
+checks through your host's shell tool. Use `agent-trash` when it is on `PATH`;
+otherwise replace it below with the quoted full path to your installed adapter's
+`bin/agent-trash`, as described in your host's section:
 
 ```bash
 agent-trash --version
