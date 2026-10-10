@@ -11,6 +11,7 @@ accumulated storage under a size budget, and only ever reclaims what a
 reachability check proves nothing still points at.
 """
 import argparse
+import errno
 import json
 import os
 import shutil
@@ -78,6 +79,63 @@ def unique_dest(entry_dir, basename):
     return dest
 
 
+def write_manifest(entry_dir, manifest):
+    """Write the entry's manifest through a temp file and a rename, so it is never torn."""
+    tmp = os.path.join(entry_dir, MANIFEST + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp, os.path.join(entry_dir, MANIFEST))
+
+
+class SourceKept(OSError):
+    """move_path made a complete copy at dest but could not remove all of the source."""
+
+
+def _copy_node(src, dst, follow_symlinks=True):
+    """shutil.copy2, plus the nodes it cannot open. A socket or a FIFO holds no data (a socket
+    file is only a name to connect to, a FIFO only a channel), so it is made again, empty, with
+    the same type, mode and times. Device nodes still fail: copying one would read the device."""
+    mode = os.lstat(src).st_mode
+    if stat.S_ISSOCK(mode) or stat.S_ISFIFO(mode):
+        os.mknod(dst, mode)
+        shutil.copystat(src, dst, follow_symlinks=False)
+        return dst
+    return shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+
+
+def move_path(src, dest):
+    """Move src to dest, which must not exist. On one filesystem this is a rename. Across
+    filesystems dest is copied first, and src is removed only once the copy is complete; a
+    failed copy is removed again, leaving src as it was. shutil.move left a failed copy behind,
+    and could not copy a socket or a FIFO at all. Raises SourceKept when the copy is complete
+    but src could not be removed entirely."""
+    try:
+        os.rename(src, dest)
+        return
+    except OSError as err:
+        if err.errno != errno.EXDEV:
+            raise
+    tree = os.path.isdir(src) and not os.path.islink(src)
+    try:
+        if tree:
+            shutil.copytree(src, dest, symlinks=True, copy_function=_copy_node)
+        else:
+            _copy_node(src, dest, follow_symlinks=False)
+    except BaseException:
+        if os.path.isdir(dest) and not os.path.islink(dest):
+            shutil.rmtree(dest, ignore_errors=True)
+        elif os.path.lexists(dest):
+            os.unlink(dest)
+        raise
+    try:
+        if tree:
+            shutil.rmtree(src)
+        else:
+            os.unlink(src)
+    except OSError as err:
+        raise SourceKept(err.errno, str(err))
+
+
 def cmd_put(args):
     sources = []
     for path in args.paths:
@@ -113,19 +171,40 @@ def cmd_put(args):
         "cwd": os.getcwd(),
         "items": [],
     }
+    # The manifest exists before anything moves and is rewritten after every item: whatever the
+    # entry holds stays listed and restorable when a later item fails, and no item can be stored
+    # under the manifest's name. (Written once at the end, a failure left the moved items in an
+    # entry that list, restore and empty never see, and a first item named manifest.json was
+    # overwritten by it.)
+    write_manifest(entry_dir, manifest)
+    failures = 0
     for src in sources:
         dest = unique_dest(entry_dir, os.path.basename(src))
-        shutil.move(src, dest)
+        try:
+            move_path(src, dest)
+        except SourceKept as err:
+            sys.stderr.write(
+                "agent-trash: {0} is in the trash, but the original was not fully removed: {1}\n".format(
+                    src, err.strerror
+                )
+            )
+            failures += 1
+        except OSError as err:
+            sys.stderr.write("agent-trash: could not trash {0}: {1}\n".format(src, err))
+            failures += 1
+            continue
         manifest["items"].append(
             {"original": src, "stored_as": os.path.basename(dest)}
         )
-    with open(os.path.join(entry_dir, MANIFEST), "w") as f:
-        json.dump(manifest, f, indent=2)
-    print("trashed {0} item(s) -> {1}".format(len(sources), entry_id))
+        write_manifest(entry_dir, manifest)
+    if not manifest["items"]:
+        shutil.rmtree(entry_dir)
+        return 1
+    print("trashed {0} item(s) -> {1}".format(len(manifest["items"]), entry_id))
     for item in manifest["items"]:
         print("  {0}".format(item["original"]))
     print("restore with: agent-trash restore {0}".format(entry_id))
-    return 0
+    return 1 if failures else 0
 
 
 def cmd_list(args):
@@ -166,10 +245,21 @@ def cmd_restore(args):
         parent = os.path.dirname(original)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        if os.path.lexists(original) and args.force:
-            backup = unique_dest(entry_dir, os.path.basename(original) + ".displaced")
-            shutil.move(original, backup)
-        shutil.move(stored, original)
+        try:
+            if os.path.lexists(original) and args.force:
+                backup = unique_dest(entry_dir, os.path.basename(original) + ".displaced")
+                move_path(original, backup)
+            move_path(stored, original)
+        except SourceKept as err:
+            sys.stderr.write(
+                "agent-trash: restored {0}, but its copy in the trash was not fully removed: {1}\n".format(
+                    original, err.strerror
+                )
+            )
+        except OSError as err:
+            sys.stderr.write("agent-trash: could not restore {0}: {1}\n".format(original, err))
+            failures += 1
+            continue
         print("restored {0}".format(original))
     if failures == 0:
         remaining = [n for n in os.listdir(entry_dir) if n != MANIFEST]

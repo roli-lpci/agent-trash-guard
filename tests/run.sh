@@ -610,6 +610,92 @@ python3 "$CLI" restore "$ENTRY_ID" --force > /dev/null
 check "restore --force exits 0" 0 "$?"
 check "restore --force wins" "victim" "$(cat "$WORK/project/c.txt")"
 
+# --- cli: a move across filesystems copies first, and every moved item stays listed ---
+# xdev.py makes os.rename fail with EXDEV, so the copy path runs whatever the machine mounts.
+cat > "$WORK/xdev.py" <<'PY'
+import contextlib, errno, io, os, types
+import agent_trash as at
+
+def cross_device(src, dst):
+    raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src)
+
+def use(work):
+    os.makedirs(work)
+    at.TRASH_DIR = os.path.join(work, "trash")
+    os.rename = cross_device
+    return work
+
+def run(func, **fields):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = func(types.SimpleNamespace(**fields))
+    return code, err.getvalue()
+PY
+PYTHONPATH="$WORK:$REPO_DIR/lib" python3 - "$WORK/xdev-special" <<'PY'
+import os, socket, stat, sys
+from xdev import at, run, use
+work = use(sys.argv[1])
+src = os.path.join(work, "project", "tree")
+os.makedirs(os.path.join(src, "empty"))
+with open(os.path.join(src, "file.txt"), "w") as f:
+    f.write("keep me\n")
+os.mkfifo(os.path.join(src, "fifo"))
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(os.path.join(src, "sock"))
+sock.close()
+os.symlink("file.txt", os.path.join(src, "link"))
+code, err = run(at.cmd_put, paths=[src])
+assert code == 0, err
+assert not os.path.lexists(src), "put left the source behind"
+(entry,) = at.entry_dirs()
+stored = os.path.join(at.TRASH_DIR, entry, "tree")
+assert stat.S_ISSOCK(os.lstat(os.path.join(stored, "sock")).st_mode)
+assert stat.S_ISFIFO(os.lstat(os.path.join(stored, "fifo")).st_mode)
+assert os.readlink(os.path.join(stored, "link")) == "file.txt"
+assert os.path.isdir(os.path.join(stored, "empty"))
+code, err = run(at.cmd_restore, id=entry, force=False)
+assert code == 0, err
+assert open(os.path.join(src, "file.txt")).read() == "keep me\n"
+assert stat.S_ISSOCK(os.lstat(os.path.join(src, "sock")).st_mode)
+assert stat.S_ISFIFO(os.lstat(os.path.join(src, "fifo")).st_mode)
+assert at.entry_dirs() == []
+PY
+check "put and restore move sockets, FIFOs and symlinks across filesystems" 0 "$?"
+PYTHONPATH="$WORK:$REPO_DIR/lib" python3 - "$WORK/xdev-fail" <<'PY'
+import os, sys
+from xdev import at, run, use
+if os.geteuid() == 0:  # root reads a mode-000 file, so the copy cannot be made to fail this way
+    sys.exit(0)
+work = use(sys.argv[1])
+bad = os.path.join(work, "project", "bad")
+os.makedirs(bad)
+secret = os.path.join(bad, "secret.txt")
+ok = os.path.join(work, "project", "ok.txt")
+for path in (secret, ok):
+    with open(path, "w") as f:
+        f.write("data\n")
+os.chmod(secret, 0)
+code, err = run(at.cmd_put, paths=[bad])
+assert code == 1 and "could not trash" in err, (code, err)
+assert os.path.lexists(secret), "a failed put removed the source"
+assert os.listdir(at.TRASH_DIR) == [], "a failed put left an entry or a partial copy"
+code, err = run(at.cmd_put, paths=[ok, bad])
+assert code == 1, (code, err)
+(entry,) = at.entry_dirs()
+assert [item["original"] for item in at.load_manifest(entry)["items"]] == [ok]
+assert sorted(os.listdir(os.path.join(at.TRASH_DIR, entry))) == ["manifest.json", "ok.txt"]
+assert not os.path.lexists(ok) and os.path.lexists(secret)
+os.chmod(secret, 0o600)
+PY
+check "a failed copy is undone, and items moved before it stay listed" 0 "$?"
+mkdir -p "$WORK/names"
+echo "user data" > "$WORK/names/manifest.json"
+AGENT_TRASH_DIR="$WORK/names/trash" python3 "$CLI" put "$WORK/names/manifest.json" > /dev/null
+check "put trashes a file named manifest.json" 0 "$?"
+NAMES_ENTRY="$(AGENT_TRASH_DIR="$WORK/names/trash" python3 "$CLI" list | head -1 | awk '{print $1}')"
+AGENT_TRASH_DIR="$WORK/names/trash" python3 "$CLI" restore "$NAMES_ENTRY" > /dev/null
+check "a file named manifest.json comes back intact" "user data" "$(cat "$WORK/names/manifest.json")"
+
 # --- cli: empty requires --yes, respects age ---
 echo "old" > "$WORK/project/d.txt"
 python3 "$CLI" put "$WORK/project/d.txt" > /dev/null
